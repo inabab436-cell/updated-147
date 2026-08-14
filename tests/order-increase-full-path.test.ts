@@ -95,7 +95,7 @@ describe("increase quantity when the agent restates the line loosely", () => {
     expect(res.adjustments[0]).toMatchObject({ already_deducted: 1, to_deduct: 1 });
   });
 
-  it("stored line without colour/size credits a later precise line", () => {
+  it("stored line without colour/size does not steal credit from a later precise variant", () => {
     const storedLoose = {
       status: "new",
       items: canonicalizeOrderItems(products as any, [looseLine(1)]),
@@ -103,7 +103,8 @@ describe("increase quantity when the agent restates the line loosely", () => {
     };
     const cleaned = canonicalizeOrderItems(products as any, [agentLine(2)]);
     const res = subtractAlreadyDeducted(cleaned as any, [storedLoose] as any);
-    expect(res.items[0]!.quantity).toBe(1);
+    expect(res.items[0]!.quantity).toBe(2);
+    expect(res.adjustments).toHaveLength(0);
   });
 
   it("a genuinely different colour gets NO credit", () => {
