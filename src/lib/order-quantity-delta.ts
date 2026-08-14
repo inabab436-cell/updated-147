@@ -77,21 +77,21 @@ function lineParts(item: { product_name?: unknown; color?: unknown; size?: unkno
 
 /**
  * A stored line and a requested line describe the SAME physical line when the
- * product matches and neither attribute contradicts the other. An attribute
- * that is missing on one side (the agent restated the line without repeating
- * the colour/size) is not a contradiction — it must not turn an already
- * deducted line into a brand new one, otherwise the same pieces are deducted
- * twice. Two DIFFERENT non-empty values are a real contradiction (blue vs red).
+ * product matches and the requested line either repeats each attribute or
+ * omits it. A missing attribute on the NEW request means "same selection, not
+ * restated". A missing attribute on the STORED line cannot credit a later,
+ * explicit variant: that could consume the stock delta of a genuinely new
+ * colour/size. Two different non-empty values are always a contradiction.
  */
-function attributesCompatible(a: string, b: string): boolean {
-  return a === b || a === "" || b === "";
+function storedAttributeMatchesRequest(stored: string, requested: string): boolean {
+  return stored === requested || requested === "";
 }
 
-function linesPair(a: LinePart, b: LinePart): boolean {
+function linesPair(stored: LinePart, requested: LinePart): boolean {
   return (
-    a.product === b.product &&
-    attributesCompatible(a.color, b.color) &&
-    attributesCompatible(a.size, b.size)
+    stored.product === requested.product &&
+    storedAttributeMatchesRequest(stored.color, requested.color) &&
+    storedAttributeMatchesRequest(stored.size, requested.size)
   );
 }
 
