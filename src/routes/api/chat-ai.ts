@@ -1291,7 +1291,7 @@ export const Route = createFileRoute("/api/chat-ai")({
               const { data: orders } = await supabase
                 .from("orders")
                 .select(
-                  "order_number, items, status, payment_status, payment_method, payment_confirmed_at, total_price, created_at, stock_deducted",
+                  "order_number, items, notes, status, payment_status, payment_method, payment_confirmed_at, subtotal_price, discount_amount, shipping_cost, total_price, created_at, stock_deducted",
                 )
                 .eq("conversation_id", conversation_id)
                 .order("created_at", { ascending: false });
@@ -1539,7 +1539,7 @@ export const Route = createFileRoute("/api/chat-ai")({
                     justConfirmed.map((o) => String(o.order_number ?? "-")).join(", ") +
                     ". Treat these orders as fully confirmed and paid: never ask the customer to pay again, never ask for a transfer screenshot again, never ask them to confirm the order again, and never say the order is still waiting for payment. If they ask, reassure them that the payment arrived and the order is being processed."
                   : "") +
-                "\nNever create a new order for an order that is already listed here.";
+                "\nNever create a second order for an order listed here. If the customer asks to add products, update that same order through create_order.";
             }
           }
 
@@ -1650,7 +1650,7 @@ export const Route = createFileRoute("/api/chat-ai")({
             function: {
               name: "create_order",
               description:
-                "Create a new order in the system. MUST only be called AFTER you have (a) presented a full order summary to the customer AND (b) received explicit final confirmation from the customer. Never call this to confirm/clarify an already-registered order.",
+                "Create a new order, or update the existing order in this conversation when the customer adds pieces/products. MUST only be called AFTER you have (a) presented a full or revised order summary and (b) received explicit final confirmation. Never call this merely to confirm/clarify a registered order.",
               parameters: {
                 type: "object",
                 properties: {
@@ -2460,6 +2460,8 @@ export const Route = createFileRoute("/api/chat-ai")({
               }
             }
 
+            const requestedItemTotals = cleanedItems.map((item) => ({ ...item }));
+
             // ALREADY-DEDUCTED QUANTITIES — when the customer adds more of a
             // product they already ordered in this conversation, the agent
             // states the new TOTAL of the line. The earlier pieces are already
@@ -2514,6 +2516,18 @@ export const Route = createFileRoute("/api/chat-ai")({
                 ? safeSlice(args.notes.trim(), 0, 2000)
                 : null;
 
+            // The database row must contain the COMPLETE updated basket, while
+            // cleanedItems now contains only the stock delta. Retain every old
+            // line and replace only totals explicitly changed by the customer.
+            let orderItemsToStore = requestedItemTotals;
+            if (latestConversationOrder) {
+              const { mergeOrderItemTotals } = await import("@/lib/order-item-merge");
+              const oldItems = Array.isArray(latestConversationOrder.items)
+                ? (latestConversationOrder.items as any[])
+                : [];
+              orderItemsToStore = mergeOrderItemTotals(oldItems, requestedItemTotals);
+            }
+
 
             // PRICING — the order is stored WITH its real numbers, priced by
             // the same deterministic offer engine the agent must use. Without
@@ -2523,15 +2537,15 @@ export const Route = createFileRoute("/api/chat-ai")({
             const pricing = priceOrderItems({
               products: merchantData.products as any,
               offers: liveOffers,
-              items: cleanedItems,
+               items: orderItemsToStore,
             });
-            for (let i = 0; i < cleanedItems.length; i++) {
+            for (let i = 0; i < orderItemsToStore.length; i++) {
               const p = pricing.items[i];
               if (!p) continue;
-              cleanedItems[i].product_id = p.product_id;
-              cleanedItems[i].unit_price = p.unit_price;
-              cleanedItems[i].price = p.unit_price;
-              cleanedItems[i].line_total = p.line_total;
+              orderItemsToStore[i].product_id = p.product_id;
+              orderItemsToStore[i].unit_price = p.unit_price;
+              orderItemsToStore[i].price = p.unit_price;
+              orderItemsToStore[i].line_total = p.line_total;
             }
 
             // SHIPPING — inferred from the address and everything the customer
@@ -2542,10 +2556,13 @@ export const Route = createFileRoute("/api/chat-ai")({
               [address, ...customerTexts],
             );
             const shippingZone = shippingMatch.zone;
+            const existingShipping = Number(latestConversationOrder?.shipping_cost);
             const shippingCost =
-              shippingZone && Number.isFinite(Number(shippingZone.price))
-                ? Math.max(0, Number(shippingZone.price))
-                : 0;
+              latestConversationOrder && Number.isFinite(existingShipping)
+                ? Math.max(0, existingShipping)
+                : shippingZone && Number.isFinite(Number(shippingZone.price))
+                  ? Math.max(0, Number(shippingZone.price))
+                  : 0;
             if (!shippingZone && (merchantData.shipping ?? []).length >= 1) {
               const zoneNames = merchantData.shipping.map((s) =>
                 [s.country, s.region].filter(Boolean).join(" / "),
@@ -2594,7 +2611,9 @@ export const Route = createFileRoute("/api/chat-ai")({
             const deductionPlan = paymentDeductionPlan(chosenMethod?.behavior);
 
 
-            let orderNumber = newOrderNumber();
+            let orderNumber = latestConversationOrder
+              ? String(latestConversationOrder.order_number ?? "")
+              : newOrderNumber();
             let insertAttempts = 0;
             const MAX_ORDER_NUMBER_ATTEMPTS = 25;
             // Atomic: the DB function locks the matching product_variants rows,
@@ -2605,9 +2624,24 @@ export const Route = createFileRoute("/api/chat-ai")({
             // the same product/color/size impossible to oversell.
             while (true) {
               insertAttempts++;
-              const { data: rpcData, error: orderErr } = await supabase.rpc(
-                "create_order_with_stock",
-                {
+              const updatingExisting = Boolean(latestConversationOrder && orderNumber);
+              const rpcCall = updatingExisting
+                ? supabase.rpc("update_order_with_stock", {
+                    p_order_number: orderNumber,
+                    p_conversation_id: conversation_id,
+                    p_merchant_id: merchant_id,
+                    p_items: orderItemsToStore,
+                    p_stock_items:
+                      String(latestConversationOrder?.payment_status ?? "confirmed") === "pending"
+                        ? orderItemsToStore
+                        : cleanedItems,
+                    p_notes: notes,
+                    p_subtotal: pricing.subtotal,
+                    p_discount: pricing.discount_total,
+                    p_shipping: shippingCost,
+                    p_total: grandTotal,
+                  })
+                : supabase.rpc("create_order_with_stock", {
                   p_order_number: orderNumber,
                   p_customer_name: name,
                   p_customer_phone: phone,
@@ -2622,9 +2656,8 @@ export const Route = createFileRoute("/api/chat-ai")({
                   // deducted until the merchant confirms the payment.
                   p_deduct_stock: deductionPlan.deductStock,
                   p_payment_status: deductionPlan.paymentStatus,
-
-                },
-              );
+                });
+              const { data: rpcData, error: orderErr } = await rpcCall;
               if (!orderErr) {
                 const res = (rpcData ?? {}) as any;
                 if (res.ok === false && res.error === "insufficient_stock") {
@@ -2640,7 +2673,7 @@ export const Route = createFileRoute("/api/chat-ai")({
                     createdOrderNumber: null,
                   };
                 }
-                if (deductionPlan.deductStock) {
+                if (deductionPlan.deductStock && String(latestConversationOrder?.payment_status ?? "confirmed") !== "pending") {
                   await refreshStockSnapshotAfterMutation();
                 }
                 break;
@@ -2648,7 +2681,7 @@ export const Route = createFileRoute("/api/chat-ai")({
               const code = (orderErr as any)?.code;
               const msg = String((orderErr as any)?.message ?? "");
               const isOrderNumberCollision =
-                code === "23505" && /order_number/i.test(msg);
+                !updatingExisting && code === "23505" && /order_number/i.test(msg);
               if (isOrderNumberCollision && insertAttempts < MAX_ORDER_NUMBER_ATTEMPTS) {
                 console.warn(`[chat-ai] order_number collision on ${orderNumber}, retrying (attempt ${insertAttempts})`);
                 orderNumber = newOrderNumber();
@@ -2663,7 +2696,7 @@ export const Route = createFileRoute("/api/chat-ai")({
 
             // Store the real value of the order (products − discount + shipping),
             // so the merchant sees it and every offer check works on numbers.
-            if (grandTotal > 0 || pricing.subtotal > 0) {
+            if (!latestConversationOrder && (grandTotal > 0 || pricing.subtotal > 0)) {
               const { error: totalErr } = await supabase
                 .from("orders")
                 .update({ total_price: grandTotal })
@@ -2692,10 +2725,10 @@ export const Route = createFileRoute("/api/chat-ai")({
                 name,
                 phone,
                 address,
-                product_name: cleanedItems[0]?.product_name ?? null,
-                color: cleanedItems[0]?.color ?? null,
-                size: cleanedItems[0]?.size ?? null,
-                quantity: cleanedItems[0]?.quantity ?? null,
+                product_name: orderItemsToStore[0]?.product_name ?? null,
+                color: orderItemsToStore[0]?.color ?? null,
+                size: orderItemsToStore[0]?.size ?? null,
+                quantity: orderItemsToStore[0]?.quantity ?? null,
                 payment_method: chosenMethod?.name ?? rawPayment ?? null,
                 shipping_zone: zoneLabel,
               },
@@ -2706,7 +2739,9 @@ export const Route = createFileRoute("/api/chat-ai")({
             await supabase.from("notifications").insert({
               type: "new_order",
               conversation_id,
-              message: `طلب جديد ${orderNumber}`,
+              message: latestConversationOrder
+                ? `تم تحديث الطلب ${orderNumber} وإضافة منتجات إليه`
+                : `طلب جديد ${orderNumber}`,
               is_read: false,
             });
 
@@ -2746,7 +2781,7 @@ export const Route = createFileRoute("/api/chat-ai")({
             }
 
 
-            if (customer?.id) {
+            if (customer?.id && !latestConversationOrder) {
               try {
                 // An order placed with this number is the strongest possible
                 // confirmation, so the number becomes CONFIRMED state here.
