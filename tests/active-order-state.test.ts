@@ -82,8 +82,8 @@ describe("ACTIVE ORDER STATE wiring", () => {
   );
 
   it("is appended to the pinned fresh store snapshot", () => {
-    const start = source.indexOf("const freshStoreSnapshot =");
-    const snap = source.slice(start, source.indexOf(";", start));
+    const start = source.indexOf("const buildFreshStoreSnapshot =");
+    const snap = source.slice(start, source.indexOf("let freshStoreSnapshot", start));
     expect(snap).toContain("activeOrderStateBlock");
   });
 

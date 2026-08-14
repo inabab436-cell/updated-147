@@ -69,6 +69,13 @@ describe("increase quantity on an existing order — full path", () => {
     expect(delta).toBeGreaterThan(-1);
     expect(canon).toBeLessThan(delta);
   });
+
+  it("updates the existing order atomically instead of inserting a second order", () => {
+    const src = readFileSync("src/routes/api/chat-ai.ts", "utf8");
+    expect(src).toContain('supabase.rpc("update_order_with_stock"');
+    expect(src).toContain("mergeOrderItemTotals(oldItems, requestedItemTotals)");
+    expect(src).toContain("latestConversationOrder && !deductionPlan.requiresPayment");
+  });
 });
 
 describe("increase quantity when the agent restates the line loosely", () => {

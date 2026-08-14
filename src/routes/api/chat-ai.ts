@@ -2588,7 +2588,7 @@ export const Route = createFileRoute("/api/chat-ai")({
             const zoneLabel = shippingZone
               ? [shippingZone.country, shippingZone.region].filter(Boolean).join(" / ")
               : null;
-            const notes = safeSlice(
+            const calculatedNotes = safeSlice(
               [
                 customerNote ?? "",
                 "— تفاصيل الأوردر —",
@@ -2605,6 +2605,11 @@ export const Route = createFileRoute("/api/chat-ai")({
               0,
               2000,
             );
+            const notes = latestConversationOrder
+              ? typeof latestConversationOrder.notes === "string"
+                ? latestConversationOrder.notes
+                : null
+              : calculatedNotes;
 
 
             const { paymentDeductionPlan } = await import("@/lib/storefront-order.server");
@@ -2749,7 +2754,7 @@ export const Route = createFileRoute("/api/chat-ai")({
             // Automatic payment method → the order is ALREADY paid, so it never
             // reaches the merchant's "confirm payment" action. Count the offer
             // beneficiaries here, otherwise the counters never move.
-            if (!deductionPlan.requiresPayment && merchant_id) {
+            if (!latestConversationOrder && !deductionPlan.requiresPayment && merchant_id) {
               try {
                 const { recordOfferRedemptionsForOrderNumbers } = await import(
                   "@/lib/offer-redemptions.server"
@@ -2763,6 +2768,11 @@ export const Route = createFileRoute("/api/chat-ai")({
               }
             }
             try {
+              if (latestConversationOrder) {
+                // The in-app notification above is enough for an amendment;
+                // do not send the merchant a second "new order" email.
+                throw new Error("existing_order_updated");
+              }
               if (merchant_id && conversation_id) {
                 const { notifyMerchantByEmail, orderEmail } = await import(
                   "@/lib/email-notify.server"
@@ -2777,7 +2787,9 @@ export const Route = createFileRoute("/api/chat-ai")({
                 });
               }
             } catch (e) {
-              console.error("[chat-ai] order email notify skipped", e);
+              if (!(e instanceof Error) || e.message !== "existing_order_updated") {
+                console.error("[chat-ai] order email notify skipped", e);
+              }
             }
 
 
